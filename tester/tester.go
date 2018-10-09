@@ -3,10 +3,10 @@ package tester
 import (
 	"encoding/base64"
 	"fmt"
-	lachesisNet "github.com/andrecronje/lachesis/net"
+	"github.com/andrecronje/lachesis/src/peers"
+	"github.com/andrecronje/lachesis/src/proxy/lachesis"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
-	"io/ioutil"
 	"log"
 	"math/rand"
 	"net"
@@ -17,7 +17,7 @@ import (
 	"time"
 )
 
-func PingNodesN(participants []lachesisNet.Peer, p map[string]int, n uint64, proxyAddress string) {
+func PingNodesN(participants []*peers.Peer, p peers.PubKeyPeers, n uint64, serviceAddress string) {
 	txId := UniqueID{counter: 1}
 
 	wg := new(sync.WaitGroup)
@@ -26,20 +26,20 @@ func PingNodesN(participants []lachesisNet.Peer, p map[string]int, n uint64, pro
 	for i := uint64(0); i < n; i++ {
 		wg.Add(1)
 		participant := participants[rand.Intn(len(participants))]
-		nodeId := p[participant.NetAddr]
+		node := p[participant.PubKeyHex]
 
-		ipAddr, err := transact(participant, nodeId, txId, proxyAddress)
+		ipAddr, err := transact(*participant, node.ID, txId, serviceAddress)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Fatal error: %s\n", err.Error())
 			fmt.Printf("Fatal error:\t\t\t%s\n", err.Error())
 			if ipAddr != "" {
-				fmt.Printf("Failed to ping:\t\t\t%s (id=%d)\n", ipAddr, nodeId)
+				fmt.Printf("Failed to ping:\t\t\t%s (id=%d)\n", ipAddr, node)
 			} else {
-				fmt.Printf("Failed to ping:\t\t\tid=%d\n", nodeId)
+				fmt.Printf("Failed to ping:\t\t\tid=%d\n", node)
 			}
 			fmt.Printf("Failed to send transaction:\t%d\n\n", txId.Get()-1)
 		} else {
-			fmt.Printf("Pinged:\t\t\t%s (id=%d)\n", ipAddr, nodeId)
+			fmt.Printf("Pinged:\t\t\t%s (id=%d)\n", ipAddr, node)
 			fmt.Printf("Last transaction sent:\t%d\n\n", txId.Get()-1)
 		}
 
@@ -51,7 +51,7 @@ func PingNodesN(participants []lachesisNet.Peer, p map[string]int, n uint64, pro
 	wg.Wait()
 }
 
-func sendTransaction(target lachesisNet.Peer) {
+func sendTransaction(target peers.Peer) {
 	ip := &layers.IPv4{
 		SrcIP: GetOutboundIP(),
 		DstIP: net.IP(target.NetAddr),
@@ -87,35 +87,14 @@ func GetOutboundIP() net.IP {
 	return localAddr.IP
 }
 
-func transact(target lachesisNet.Peer, nodeId int, txId UniqueID, proxyAddress string) (string, error) {
-	// rpcClient := jsonrpc.NewClient(proxyAddress)
-	// rpcClient.Call("createPerson", "Alex", 33, "Germany")
-	// generates body: {"method":"createPerson","params":["Alex",33,"Germany"],"id":0,"jsonrpc":"2.0"}
+func transact(target peers.Peer, nodeId int, txId UniqueID, proxyAddress string) (string, error) {
+	addr := fmt.Sprintf("%s:%d", strings.Split(target.NetAddr, ":")[0], 9000)
+	proxy := lachesis.NewSocketLachesisProxyClient(addr, 10 * time.Second)
 
-	tcpAddr, err := net.ResolveTCPAddr("tcp4",
-		fmt.Sprintf("%s:%d", strings.Split(target.NetAddr, ":")[0], 9000))
-	if err != nil {
-		return "", err
-	}
-	conn, err := net.DialTCP("tcp", nil, tcpAddr)
-	if err != nil {
-		return "", err
-	}
+	_, err := proxy.SubmitTx([]byte("oh hai"))
+	// fmt.Println("Submitted tx, ack=", ack)  # `ack` is now `_`
 
-	payload := fmt.Sprintf("%s{\"method\":\"Lachesis.SubmitTx\",\"params\":[\"whatever\"],\"id\":\"whatever\"}",
-		base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("Node%d Tx%d", nodeId, txId.Get()))))
-
-	_, err = conn.Write([]byte(payload))
-
-	if err != nil {
-		return "", err
-	}
-	result, err := ioutil.ReadAll(conn)
-	if err != nil {
-		return "", err
-	}
-	fmt.Println(string(result))
-	return tcpAddr.String(), err
+	return "hi", err
 }
 
 type UniqueID struct {
