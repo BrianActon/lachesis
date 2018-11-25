@@ -3,18 +3,12 @@ package peers
 import (
 	"encoding/hex"
 
-	"github.com/andrecronje/lachesis/src/common"
+	"github.com/Fantom-foundation/go-lachesis/src/common"
 )
 
 const (
 	jsonPeerPath = "peers.json"
 )
-
-type Peer struct {
-	ID        int `json:"-"`
-	NetAddr   string
-	PubKeyHex string
-}
 
 func NewPeer(pubKeyHex, netAddr string) *Peer {
 	peer := &Peer{
@@ -25,6 +19,12 @@ func NewPeer(pubKeyHex, netAddr string) *Peer {
 	peer.computeID()
 
 	return peer
+}
+
+func (this *Peer) Equals(that *Peer) bool {
+	return this.ID == that.ID &&
+		this.NetAddr == that.NetAddr &&
+		this.PubKeyHex == that.PubKeyHex
 }
 
 func (p *Peer) PubKeyBytes() ([]byte, error) {
@@ -39,7 +39,7 @@ func (p *Peer) computeID() error {
 		return err
 	}
 
-	p.ID = common.Hash32(pubKey)
+	p.ID = int64(common.Hash32(pubKey))
 
 	return nil
 }
@@ -60,7 +60,7 @@ func ExcludePeer(peers []*Peer, peer string) (int, []*Peer) {
 	index := -1
 	otherPeers := make([]*Peer, 0, len(peers))
 	for i, p := range peers {
-		if p.NetAddr != peer {
+		if p.NetAddr != peer && p.PubKeyHex != peer {
 			otherPeers = append(otherPeers, p)
 		} else {
 			index = i

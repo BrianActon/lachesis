@@ -3,9 +3,12 @@ package node
 import (
 	"math/rand"
 
-	"github.com/andrecronje/lachesis/src/peers"
+	"github.com/Fantom-foundation/go-lachesis/src/peers"
 )
 
+// PeerSelector provides an interface for the lachesis node to 
+// update the last peer it gossiped with and select the next peer
+// to gossip with 
 type PeerSelector interface {
 	Peers() *peers.Peers
 	UpdateLast(peer string)

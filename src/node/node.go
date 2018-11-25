@@ -7,14 +7,13 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
-	mq "github.com/eclipse/paho.mqtt.golang"
 
 	"strconv"
 
-	"github.com/andrecronje/lachesis/src/net"
-	"github.com/andrecronje/lachesis/src/peers"
-	"github.com/andrecronje/lachesis/src/poset"
-	"github.com/andrecronje/lachesis/src/proxy"
+	"github.com/Fantom-foundation/go-lachesis/src/net"
+	"github.com/Fantom-foundation/go-lachesis/src/peers"
+	"github.com/Fantom-foundation/go-lachesis/src/poset"
+	"github.com/Fantom-foundation/go-lachesis/src/proxy"
 )
 
 type Node struct {
@@ -23,7 +22,7 @@ type Node struct {
 	conf   *Config
 	logger *logrus.Entry
 
-	id       int
+	id       int64
 	core     *Core
 	coreLock sync.Mutex
 
@@ -34,10 +33,10 @@ type Node struct {
 
 	trans net.Transport
 	netCh <-chan net.RPC
-	mqtt *net.MqttSocket
 
-	proxy    proxy.AppProxy
-	submitCh chan []byte
+	proxy            proxy.AppProxy
+	submitCh         chan []byte
+	submitInternalCh chan poset.InternalTransaction
 
 	commitCh chan poset.Block
 
@@ -53,7 +52,7 @@ type Node struct {
 }
 
 func NewNode(conf *Config,
-	id int,
+	id int64,
 	key *ecdsa.PrivateKey,
 	participants *peers.Peers,
 	store poset.Store,
@@ -67,36 +66,34 @@ func NewNode(conf *Config,
 	commitCh := make(chan poset.Block, 400)
 	core := NewCore(id, key, pmap, store, commitCh, conf.Logger)
 
-	peerSelector := NewRandomPeerSelector(participants, localAddr)
+	pubKey := core.HexID()
+
+	peerSelector := NewRandomPeerSelector(participants, pubKey)
 
 	node := Node{
-		id:           id,
-		conf:         conf,
-		core:         &core,
-		localAddr:    localAddr,
-		logger:       conf.Logger.WithField("this_id", id),
-		peerSelector: peerSelector,
-		trans:        trans,
-		netCh:        trans.Consumer(),
-		proxy:        proxy,
-		submitCh:     proxy.SubmitCh(),
-		commitCh:     commitCh,
-		shutdownCh:   make(chan struct{}),
-		controlTimer: NewRandomControlTimer(conf.HeartbeatTimeout),
-		start:        time.Now(),
+		id:               id,
+		conf:             conf,
+		core:             core,
+		localAddr:        localAddr,
+		logger:           conf.Logger.WithField("this_id", id),
+		peerSelector:     peerSelector,
+		trans:            trans,
+		netCh:            trans.Consumer(),
+		proxy:            proxy,
+		submitCh:         proxy.SubmitCh(),
+		submitInternalCh: proxy.SubmitInternalCh(),
+		commitCh:         commitCh,
+		shutdownCh:       make(chan struct{}),
+		controlTimer:     NewRandomControlTimer(),
+		start:            time.Now(),
 	}
 
-	wg := sync.WaitGroup{}
-	mqtt := net.NewMqttSocket("tcp://localhost:1883", func(client mq.Client, message mq.Message) {
-		node.logger.Debug("Message received : ", string(message.Payload()), " on topic ", message.Topic())
-		wg.Done()
-	})
-	node.mqtt = mqtt
+	node.logger.WithField("peers", pmap).Debug("pmap")
+	node.logger.WithField("pubKey", pubKey).Debug("pubKey")
 
 	node.needBoostrap = store.NeedBoostrap()
 
-	//Initialize as Babbling
-	node.setStarting(true)
+	// Initialize
 	node.setState(Gossiping)
 
 	return &node
@@ -125,16 +122,19 @@ func (n *Node) RunAsync(gossip bool) {
 }
 
 func (n *Node) Run(gossip bool) {
-	//The ControlTimer allows the background routines to control the
-	//heartbeat timer when the node is in the Gossiping state. The timer should
-	//only be running when there are uncommitted transactions in the system.
-	go n.controlTimer.Run()
+	// The ControlTimer allows the background routines to control the
+	// heartbeat timer when the node is in the Gossiping state. The timer should
+	// only be running when there are uncommitted transactions in the system.
+	go n.controlTimer.Run(n.conf.HeartbeatTimeout)
 
-	//Execute some background work regardless of the state of the node.
-	//Process RPC requests as well as SumbitTx and CommitBlock requests
+	// Execute some background work regardless of the state of the node.
+	// Process SubmitTx and CommitBlock requests
 	go n.doBackgroundWork()
 
-	//Execute Node State Machine
+	// pause before gossiping test transactions to allow all nodes come up
+	time.Sleep(time.Duration(n.conf.TestDelay) * time.Second)
+
+	// Execute Node State Machine
 	for {
 		// Run different routines depending on node state
 		state := n.getState()
@@ -151,31 +151,36 @@ func (n *Node) Run(gossip bool) {
 	}
 }
 
+func (n *Node) resetTimer() {
+	if !n.controlTimer.set {
+		ts := n.conf.HeartbeatTimeout
+		//Slow gossip if nothing interesting to say
+		if n.core.poset.PendingLoadedEvents == 0 &&
+			len(n.core.transactionPool) == 0 &&
+			len(n.core.blockSignaturePool) == 0 {
+			ts = time.Duration(time.Second)
+		}
+		n.controlTimer.resetCh <- ts
+	}
+}
+
 func (n *Node) doBackgroundWork() {
 	for {
 		select {
-		case rpc := <-n.netCh:
-			n.goFunc(func() {
-				n.logger.Debug("Incoming RPC")
-				n.processRPC(rpc)
-				if n.core.NeedGossip() && !n.controlTimer.set {
-					n.controlTimer.resetCh <- struct{}{}
-				}
-			})
 		case t := <-n.submitCh:
 			n.logger.Debug("Adding Transactions to Transaction Pool")
-			n.mqtt.FireEvent(t, "/mq/lachesis/tx")
 			n.addTransaction(t)
-			if !n.controlTimer.set {
-				n.controlTimer.resetCh <- struct{}{}
-			}
+			n.resetTimer()
+		case t := <-n.submitInternalCh:
+			n.logger.Debug("Adding Internal Transaction")
+			n.addInternalTransaction(t)
+			n.resetTimer()
 		case block := <-n.commitCh:
 			n.logger.WithFields(logrus.Fields{
 				"index":          block.Index(),
 				"round_received": block.RoundReceived(),
 				"transactions":   len(block.Transactions()),
 			}).Debug("Adding EventBlock")
-			n.mqtt.FireEvent(block, "/mq/lachesis/block")
 			if err := n.commit(block); err != nil {
 				n.logger.WithField("error", err).Error("Adding EventBlock")
 			}
@@ -185,27 +190,27 @@ func (n *Node) doBackgroundWork() {
 	}
 }
 
-//lachesis is interrupted when a gossip function, launched asynchronously, changes
-//the state from Gossiping to CatchingUp, or when the node is shutdown.
-//Otherwise, it periodicaly initiates gossip while there is something to gossip
-//about, or waits.
+// lachesis is interrupted when a gossip function, launched asynchronously, changes
+// the state from Gossiping to CatchingUp, or when the node is shutdown.
+// Otherwise, it processes RPC requests, periodicaly initiates gossip while there
+// is something to gossip about, or waits.
 func (n *Node) lachesis(gossip bool) {
-	returnCh := make(chan struct{})
+	returnCh := make(chan struct{}, 100)
 	for {
 		select {
+		case rpc := <-n.netCh:
+			n.goFunc(func() {
+				n.logger.Debug("Processing RPC")
+				n.processRPC(rpc)
+				n.resetTimer()
+			})
 		case <-n.controlTimer.tickCh:
 			if gossip {
-				proceed, err := n.preGossip()
-				if proceed && err == nil {
-					peer := n.peerSelector.Next()
-					n.goFunc(func() { n.gossip(peer.NetAddr, returnCh) })
-				}
+				n.logger.Debug("Gossip")
+				peer := n.peerSelector.Next()
+				n.goFunc(func() { n.gossip(peer.NetAddr, returnCh) })
 			}
-			if !n.core.NeedGossip() {
-				n.controlTimer.stopCh <- struct{}{}
-			} else if !n.controlTimer.set {
-				n.controlTimer.resetCh <- struct{}{}
-			}
+			n.resetTimer()
 		case <-returnCh:
 			return
 		case <-n.shutdownCh:
@@ -215,18 +220,6 @@ func (n *Node) lachesis(gossip bool) {
 }
 
 func (n *Node) processRPC(rpc net.RPC) {
-
-	if s := n.getState(); s != Gossiping {
-		n.logger.WithField("state", s.String()).Debug("Discarding RPC Request")
-		//XXX Use a SyncResponse by default but this should be either a special
-		//ErrorResponse type or a type that corresponds to the request
-		resp := &net.SyncResponse{
-			FromID: n.id,
-		}
-		rpc.Respond(resp, fmt.Errorf("Not ready: %s", s.String()))
-		return
-	}
-
 	switch cmd := rpc.Command.(type) {
 	case *net.SyncRequest:
 		n.processSyncRequest(rpc, cmd)
@@ -236,7 +229,7 @@ func (n *Node) processRPC(rpc net.RPC) {
 		n.processFastForwardRequest(rpc, cmd)
 	default:
 		n.logger.WithField("cmd", rpc.Command).Error("Unexpected RPC command")
-		rpc.Respond(nil, fmt.Errorf("Unexpected command"))
+		rpc.Respond(nil, fmt.Errorf("unexpected command"))
 	}
 }
 
@@ -251,7 +244,7 @@ func (n *Node) processSyncRequest(rpc net.RPC, cmd *net.SyncRequest) {
 	}
 	var respErr error
 
-	//Check sync limit
+	// Check sync limit
 	n.coreLock.Lock()
 	overSyncLimit := n.core.OverSyncLimit(cmd.Known, n.conf.SyncLimit)
 	n.coreLock.Unlock()
@@ -259,7 +252,7 @@ func (n *Node) processSyncRequest(rpc net.RPC, cmd *net.SyncRequest) {
 		n.logger.Debug("n.core.OverSyncLimit(cmd.Known, n.conf.SyncLimit)")
 		resp.SyncLimit = true
 	} else {
-		//Compute Diff
+		// Compute Diff
 		start := time.Now()
 		n.coreLock.Lock()
 		eventDiff, err := n.core.EventDiff(cmd.Known)
@@ -271,7 +264,7 @@ func (n *Node) processSyncRequest(rpc net.RPC, cmd *net.SyncRequest) {
 			respErr = err
 		}
 
-		//Convert to WireEvents
+		// Convert to WireEvents
 		wireEvents, err := n.core.ToWire(eventDiff)
 		if err != nil {
 			n.logger.WithField("error", err).Debug("n.core.TransportEventBlock(eventDiff)")
@@ -281,7 +274,7 @@ func (n *Node) processSyncRequest(rpc net.RPC, cmd *net.SyncRequest) {
 		}
 	}
 
-	//Get Self Known
+	// Get Self Known
 	n.coreLock.Lock()
 	knownEvents := n.core.KnownEvents()
 	n.coreLock.Unlock()
@@ -329,24 +322,25 @@ func (n *Node) processFastForwardRequest(rpc net.RPC, cmd *net.FastForwardReques
 	}
 	var respErr error
 
-	//Get latest Frame
+	// Get latest Frame
 	n.coreLock.Lock()
 	block, frame, err := n.core.GetAnchorBlockWithFrame()
 	n.coreLock.Unlock()
 	if err != nil {
 		n.logger.WithField("error", err).Error("n.core.GetAnchorBlockWithFrame()")
 		respErr = err
-	}
-	resp.Block = block
-	resp.Frame = frame
+	} else {
+		resp.Block = block
+		resp.Frame = frame
 
-	//Get snapshot
-	snapshot, err := n.proxy.GetSnapshot(block.Index())
-	if err != nil {
-		n.logger.WithField("error", err).Error("n.proxy.GetSnapshot(block.Index())")
-		respErr = err
+		// Get snapshot
+		snapshot, err := n.proxy.GetSnapshot(block.Index())
+		if err != nil {
+			n.logger.WithField("error", err).Error("n.proxy.GetSnapshot(block.Index())")
+			respErr = err
+		}
+		resp.Snapshot = snapshot
 	}
-	resp.Snapshot = snapshot
 
 	n.logger.WithFields(logrus.Fields{
 		"Events": len(resp.Frame.Events),
@@ -355,30 +349,18 @@ func (n *Node) processFastForwardRequest(rpc net.RPC, cmd *net.FastForwardReques
 	rpc.Respond(resp, respErr)
 }
 
-func (n *Node) preGossip() (bool, error) {
-	n.coreLock.Lock()
-	defer n.coreLock.Unlock()
-
-	//Check if it is necessary to gossip
-	if !(n.core.NeedGossip() || n.isStarting()) {
-		return false, nil
-	}
-
-	return true, nil
-}
-
-//This function is usually called in a go-routine and needs to inform the
-//calling routine (usually the lachesis routine) when it is time to exit the
-//Gossiping state and return.
+// This function is usually called in a go-routine and needs to inform the
+// calling routine (usually the lachesis routine) when it is time to exit the
+// Gossiping state and return.
 func (n *Node) gossip(peerAddr string, parentReturnCh chan struct{}) error {
 
-	//pull
+	// pull
 	syncLimit, otherKnownEvents, err := n.pull(peerAddr)
 	if err != nil {
 		return err
 	}
 
-	//check and handle syncLimit
+	// check and handle syncLimit
 	if syncLimit {
 		n.logger.WithField("from", peerAddr).Debug("SyncLimit")
 		n.setState(CatchingUp)
@@ -386,77 +368,68 @@ func (n *Node) gossip(peerAddr string, parentReturnCh chan struct{}) error {
 		return nil
 	}
 
-	//push
+	// push
 	err = n.push(peerAddr, otherKnownEvents)
 	if err != nil {
 		return err
 	}
 
-	//update peer selector
+	// update peer selector
 	n.selectorLock.Lock()
 	n.peerSelector.UpdateLast(peerAddr)
 	n.selectorLock.Unlock()
 
 	n.logStats()
 
-	n.setStarting(false)
-
 	return nil
 }
 
-func (n *Node) pull(peerAddr string) (syncLimit bool, otherKnownEvents map[int]int, err error) {
-	//Compute Known
+func (n *Node) pull(peerAddr string) (syncLimit bool, otherKnownEvents map[int64]int64, err error) {
+	// Compute Known
 	n.coreLock.Lock()
 	knownEvents := n.core.KnownEvents()
 	n.coreLock.Unlock()
 
-	//Send SyncRequest
+	// Send SyncRequest
 	start := time.Now()
 	resp, err := n.requestSync(peerAddr, knownEvents)
 	elapsed := time.Since(start)
 	n.logger.WithField("Duration", elapsed.Nanoseconds()).Debug("n.requestSync(peerAddr, knownEvents)")
+	// FIXIT: should we catch io.EOF error here and how we process it?
+	//	if err == io.EOF {
+	//		return false, nil, nil
+	//	}
 	if err != nil {
 		n.logger.WithField("Error", err).Error("n.requestSync(peerAddr, knownEvents)")
 		return false, nil, err
 	}
 	n.logger.WithFields(logrus.Fields{
-		"from_id":    resp.FromID,
-		"sync_limit": resp.SyncLimit,
-		"events":     len(resp.Events),
-		"known":      resp.Known,
+		"from_id":     resp.FromID,
+		"sync_limit":  resp.SyncLimit,
+		"events":      len(resp.Events),
+		"known":       resp.Known,
+		"knownEvents": knownEvents,
 	}).Debug("SyncResponse")
 
 	if resp.SyncLimit {
 		return true, nil, nil
 	}
 
-	if len(resp.Events) > 0 {
-		//Add Events to poset and create new Head if necessary
-		n.coreLock.Lock()
-		err = n.sync(resp.Events)
-		n.coreLock.Unlock()
-		if err != nil {
-			n.logger.WithField("error", err).Error("n.sync(resp.Events)")
-			return false, nil, err
-		}
+	// Add Events to poset and create new Head if necessary
+	n.coreLock.Lock()
+	err = n.sync(resp.Events)
+	n.coreLock.Unlock()
+	if err != nil {
+		n.logger.WithField("error", err).Error("n.sync(resp.Events)")
+		return false, nil, err
 	}
 
 	return false, resp.Known, nil
 }
 
-func (n *Node) push(peerAddr string, knownEvents map[int]int) error {
+func (n *Node) push(peerAddr string, knownEvents map[int64]int64) error {
 
-	//If the transaction pool is not empty, create a new self-event and empty the
-	//transaction pool in its payload
-	n.coreLock.Lock()
-	err := n.core.AddSelfEventBlock("")
-	n.coreLock.Unlock()
-	if err != nil {
-		n.logger.WithField("error", err).Error("n.core.AddSelfEventBlock()")
-		return err
-	}
-
-	//Check SyncLimit
+	// Check SyncLimit
 	n.coreLock.Lock()
 	overSyncLimit := n.core.OverSyncLimit(knownEvents, n.conf.SyncLimit)
 	n.coreLock.Unlock()
@@ -465,7 +438,7 @@ func (n *Node) push(peerAddr string, knownEvents map[int]int) error {
 		return nil
 	}
 
-	//Compute Diff
+	// Compute Diff
 	start := time.Now()
 	n.coreLock.Lock()
 	eventDiff, err := n.core.EventDiff(knownEvents)
@@ -477,26 +450,29 @@ func (n *Node) push(peerAddr string, knownEvents map[int]int) error {
 		return err
 	}
 
-	//Convert to WireEvents
-	wireEvents, err := n.core.ToWire(eventDiff)
-	if err != nil {
-		n.logger.WithField("Error", err).Debug("n.core.TransferEventBlock(eventDiff)")
-		return err
-	}
+	if len(eventDiff) > 0 {
+		// Convert to WireEvents
+		wireEvents, err := n.core.ToWire(eventDiff)
+		if err != nil {
+			n.logger.WithField("Error", err).Debug("n.core.TransferEventBlock(eventDiff)")
+			return err
+		}
 
-	//Create and Send EagerSyncRequest
-	start = time.Now()
-	resp2, err := n.requestEagerSync(peerAddr, wireEvents)
-	elapsed = time.Since(start)
-	n.logger.WithField("Duration", elapsed.Nanoseconds()).Debug("n.requestEagerSync(peerAddr, wireEvents)")
-	if err != nil {
-		n.logger.WithField("Error", err).Error("n.requestEagerSync(peerAddr, wireEvents)")
-		return err
+		// Create and Send EagerSyncRequest
+		start = time.Now()
+		n.logger.WithField("wireEvents", wireEvents).Debug("Sending n.requestEagerSync.wireEvents")
+		resp2, err := n.requestEagerSync(peerAddr, wireEvents)
+		elapsed = time.Since(start)
+		n.logger.WithField("Duration", elapsed.Nanoseconds()).Debug("n.requestEagerSync(peerAddr, wireEvents)")
+		if err != nil {
+			n.logger.WithField("Error", err).Error("n.requestEagerSync(peerAddr, wireEvents)")
+			return err
+		}
+		n.logger.WithFields(logrus.Fields{
+			"from_id": resp2.FromID,
+			"success": resp2.Success,
+		}).Debug("EagerSyncResponse")
 	}
-	n.logger.WithFields(logrus.Fields{
-		"from_id": resp2.FromID,
-		"success": resp2.Success,
-	}).Debug("EagerSyncResponse")
 
 	return nil
 }
@@ -504,10 +480,10 @@ func (n *Node) push(peerAddr string, knownEvents map[int]int) error {
 func (n *Node) fastForward() error {
 	n.logger.Debug("fastForward()")
 
-	//wait until sync routines finish
+	// wait until sync routines finish
 	n.waitRoutines()
 
-	//fastForwardRequest
+	// fastForwardRequest
 	peer := n.peerSelector.Next()
 	start := time.Now()
 	resp, err := n.requestFastForward(peer.NetAddr)
@@ -526,7 +502,7 @@ func (n *Node) fastForward() error {
 		"snapshot":             resp.Snapshot,
 	}).Debug("FastForwardResponse")
 
-	//prepare core. ie: fresh poset
+	// prepare core. ie: fresh poset
 	n.coreLock.Lock()
 	err = n.core.FastForward(peer.PubKeyHex, resp.Block, resp.Frame)
 	n.coreLock.Unlock()
@@ -535,7 +511,7 @@ func (n *Node) fastForward() error {
 		return err
 	}
 
-	//update app from snapshot
+	// update app from snapshot
 	err = n.proxy.Restore(resp.Snapshot)
 	if err != nil {
 		n.logger.WithField("Error", err).Error("n.proxy.Restore(resp.Snapshot)")
@@ -543,12 +519,11 @@ func (n *Node) fastForward() error {
 	}
 
 	n.setState(Gossiping)
-	n.setStarting(true)
 
 	return nil
 }
 
-func (n *Node) requestSync(target string, known map[int]int) (net.SyncResponse, error) {
+func (n *Node) requestSync(target string, known map[int64]int64) (net.SyncResponse, error) {
 
 	args := net.SyncRequest{
 		FromID: n.id,
@@ -557,7 +532,7 @@ func (n *Node) requestSync(target string, known map[int]int) (net.SyncResponse, 
 
 	var out net.SyncResponse
 	err := n.trans.Sync(target, &args, &out)
-
+	//n.logger.WithField("out", out).Debug("requestSync(target string, known map[int]int)")
 	return out, err
 }
 
@@ -568,6 +543,9 @@ func (n *Node) requestEagerSync(target string, events []poset.WireEvent) (net.Ea
 	}
 
 	var out net.EagerSyncResponse
+	n.logger.WithFields(logrus.Fields{
+		"target": target,
+	}).Debug("requestEagerSync(target string, events []poset.WireEvent)")
 	err := n.trans.EagerSync(target, &args, &out)
 
 	return out, err
@@ -589,7 +567,7 @@ func (n *Node) requestFastForward(target string) (net.FastForwardResponse, error
 }
 
 func (n *Node) sync(events []poset.WireEvent) error {
-	//Insert Events in Poset and create new Head if necessary
+	// Insert Events in Poset and create new Head if necessary
 	start := time.Now()
 	err := n.core.Sync(events)
 	elapsed := time.Since(start)
@@ -598,7 +576,7 @@ func (n *Node) sync(events []poset.WireEvent) error {
 		return err
 	}
 
-	//Run consensus methods
+	// Run consensus methods
 	start = time.Now()
 	err = n.core.RunConsensus()
 	elapsed = time.Since(start)
@@ -612,27 +590,33 @@ func (n *Node) sync(events []poset.WireEvent) error {
 
 func (n *Node) commit(block poset.Block) error {
 
-	stateHash, err := n.proxy.CommitBlock(block)
+	stateHash := []byte{0, 1, 2}
+	_, err := n.proxy.CommitBlock(block)
+	if err != nil {
+		n.logger.WithError(err).Debug("commit(block poset.Block)")
+	}
+
 	n.logger.WithFields(logrus.Fields{
 		"block":      block.Index(),
 		"state_hash": fmt.Sprintf("%X", stateHash),
-		"err":        err,
+		// "err":        err,
 	}).Debug("commit(eventBlock poset.EventBlock)")
 
-	//XXX what do we do in case of error. Retry? This has to do with the
-	//Lachesis <-> App interface. Think about it.
+	// XXX what do we do in case of error. Retry? This has to do with the
+	// Lachesis <-> App interface. Think about it.
 
-	//An error here could be that the endpoint is not configured, not all
-	//nodes will be sending blocks to clients, in these cases -no_client can be
-	//used, alternatively should check for the error here and handle it
-	//appropriately
+	// An error here could be that the endpoint is not configured, not all
+	// nodes will be sending blocks to clients, in these cases -no_client can be
+	// used, alternatively should check for the error here and handle it
+	// appropriately
 
-	//There is no point in using the stateHash if we know it is wrong
-	if err == nil {
-		//inmem statehash would be different than proxy statehash
-		//inmem is simply the hash of transactions
-		//this requires a 1:1 relationship with nodes and clients
-		//multiple nodes can't read from the same client
+	// There is no point in using the stateHash if we know it is wrong
+	// if err == nil {
+	if true {
+		// inmem statehash would be different than proxy statehash
+		// inmem is simply the hash of transactions
+		// this requires a 1:1 relationship with nodes and clients
+		// multiple nodes can't read from the same client
 
 		block.Body.StateHash = stateHash
 		n.coreLock.Lock()
@@ -644,7 +628,7 @@ func (n *Node) commit(block poset.Block) error {
 		n.core.AddBlockSignature(sig)
 	}
 
-	return err
+	return nil
 }
 
 func (n *Node) addTransaction(tx []byte) {
@@ -653,35 +637,41 @@ func (n *Node) addTransaction(tx []byte) {
 	n.core.AddTransactions([][]byte{tx})
 }
 
+func (n *Node) addInternalTransaction(tx poset.InternalTransaction) {
+	n.coreLock.Lock()
+	defer n.coreLock.Unlock()
+	n.core.AddInternalTransactions([]poset.InternalTransaction{tx})
+}
+
 func (n *Node) Shutdown() {
 	if n.getState() != Shutdown {
-		n.mqtt.FireEvent("Shutdown()", "/mq/lachesis/node")
+		// n.mqtt.FireEvent("Shutdown()", "/mq/lachesis/node")
 		n.logger.Debug("Shutdown()")
 
-		//Exit any non-shutdown state immediately
+		// Exit any non-shutdown state immediately
 		n.setState(Shutdown)
 
-		//Stop and wait for concurrent operations
+		// Stop and wait for concurrent operations
 		close(n.shutdownCh)
 		n.waitRoutines()
 
-		//For some reason this needs to be called after closing the shutdownCh
-		//Not entirely sure why...
+		// For some reason this needs to be called after closing the shutdownCh
+		// Not entirely sure why...
 		n.controlTimer.Shutdown()
 
-		//transport and store should only be closed once all concurrent operations
-		//are finished otherwise they will panic trying to use close objects
+		// transport and store should only be closed once all concurrent operations
+		// are finished otherwise they will panic trying to use close objects
 		n.trans.Close()
 		n.core.poset.Store.Close()
 	}
 }
 
 func (n *Node) GetStats() map[string]string {
-	toString := func(i *int) string {
+	toString := func(i *int64) string {
 		if i == nil {
 			return "nil"
 		}
-		return strconv.Itoa(*i)
+		return strconv.FormatInt(*i, 10)
 	}
 
 	timeElapsed := time.Since(n.start)
@@ -703,10 +693,10 @@ func (n *Node) GetStats() map[string]string {
 		"heartbeat":               strconv.FormatFloat(n.conf.HeartbeatTimeout.Seconds(), 'f', 2, 64),
 		"node_current":            strconv.FormatInt(time.Now().Unix(), 10),
 		"node_start":              strconv.FormatInt(n.start.Unix(), 10),
-		"last_block_index":        strconv.Itoa(n.core.GetLastBlockIndex()),
-		"consensus_events":        strconv.Itoa(consensusEvents),
-		"sync_limit":              strconv.Itoa(n.conf.SyncLimit),
-		"consensus_transactions":  strconv.Itoa(consensusTransactions),
+		"last_block_index":        strconv.FormatInt(n.core.GetLastBlockIndex(), 10),
+		"consensus_events":        strconv.FormatInt(consensusEvents, 10),
+		"sync_limit":              strconv.FormatInt(n.conf.SyncLimit, 10),
+		"consensus_transactions":  strconv.FormatUint(consensusTransactions, 10),
 		"undetermined_events":     strconv.Itoa(len(n.core.GetUndeterminedEvents())),
 		"transaction_pool":        strconv.Itoa(len(n.core.transactionPool)),
 		"num_peers":               strconv.Itoa(n.peerSelector.Peers().Len()),
@@ -715,10 +705,10 @@ func (n *Node) GetStats() map[string]string {
 		"events_per_second":       strconv.FormatFloat(consensusEventsPerSecond, 'f', 2, 64),
 		"rounds_per_second":       strconv.FormatFloat(consensusRoundsPerSecond, 'f', 2, 64),
 		"round_events":            strconv.Itoa(n.core.GetLastCommittedRoundEventsCount()),
-		"id":                      strconv.Itoa(n.id),
+		"id":                      strconv.FormatInt(n.id, 10),
 		"state":                   n.getState().String(),
 	}
-	n.mqtt.FireEvent(s, "/mq/lachesis/stats" )
+	// n.mqtt.FireEvent(s, "/mq/lachesis/stats")
 	return s
 }
 
@@ -734,11 +724,12 @@ func (n *Node) logStats() {
 		"num_peers":              stats["num_peers"],
 		"sync_rate":              stats["sync_rate"],
 		"events/s":               stats["events_per_second"],
+		"t/s":                    stats["transactions_per_second"],
 		"rounds/s":               stats["rounds_per_second"],
 		"round_events":           stats["round_events"],
 		"id":                     stats["id"],
 		"state":                  stats["state"],
-	}).Debug("logStats()")
+	}).Warn("logStats()")
 }
 
 func (n *Node) SyncRate() float64 {
@@ -761,27 +752,36 @@ func (n *Node) GetLastEventFrom(participant string) (string, bool, error) {
 	return n.core.poset.Store.LastEventFrom(participant)
 }
 
-func (n *Node) GetKnownEvents() map[int]int {
+func (n *Node) GetKnownEvents() map[int64]int64 {
 	return n.core.poset.Store.KnownEvents()
+}
+
+func (n *Node) GetEvents() (map[int64]int64, error) {
+	res := n.core.KnownEvents()
+	return res, nil
 }
 
 func (n *Node) GetConsensusEvents() []string {
 	return n.core.poset.Store.ConsensusEvents()
 }
 
-func (n *Node) GetRound(roundIndex int) (poset.RoundInfo, error) {
+func (n *Node) GetConsensusTransactionsCount() uint64 {
+	return n.core.GetConsensusTransactionsCount()
+}
+
+func (n *Node) GetRound(roundIndex int64) (poset.RoundInfo, error) {
 	return n.core.poset.Store.GetRound(roundIndex)
 }
 
-func (n *Node) GetLastRound() int {
+func (n *Node) GetLastRound() int64 {
 	return n.core.poset.Store.LastRound()
 }
 
-func (n *Node) GetRoundWitnesses(roundIndex int) []string {
+func (n *Node) GetRoundWitnesses(roundIndex int64) []string {
 	return n.core.poset.Store.RoundWitnesses(roundIndex)
 }
 
-func (n *Node) GetRoundEvents(roundIndex int) int {
+func (n *Node) GetRoundEvents(roundIndex int64) int {
 	return n.core.poset.Store.RoundEvents(roundIndex)
 }
 
@@ -789,10 +789,10 @@ func (n *Node) GetRoot(rootIndex string) (poset.Root, error) {
 	return n.core.poset.Store.GetRoot(rootIndex)
 }
 
-func (n *Node) GetBlock(blockIndex int) (poset.Block, error) {
+func (n *Node) GetBlock(blockIndex int64) (poset.Block, error) {
 	return n.core.poset.Store.GetBlock(blockIndex)
 }
 
-func (n *Node) ID() int {
+func (n *Node) ID() int64 {
 	return n.id
 }

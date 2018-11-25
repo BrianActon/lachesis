@@ -3,16 +3,16 @@ package mobile
 import (
 	"fmt"
 
-	"github.com/andrecronje/lachesis/src/crypto"
-	"github.com/andrecronje/lachesis/src/lachesis"
-	"github.com/andrecronje/lachesis/src/node"
-	"github.com/andrecronje/lachesis/src/peers"
-	"github.com/andrecronje/lachesis/src/proxy"
+	"github.com/Fantom-foundation/go-lachesis/src/crypto"
+	"github.com/Fantom-foundation/go-lachesis/src/lachesis"
+	"github.com/Fantom-foundation/go-lachesis/src/node"
+	"github.com/Fantom-foundation/go-lachesis/src/peers"
+	"github.com/Fantom-foundation/go-lachesis/src/proxy"
 	"github.com/sirupsen/logrus"
 )
 
 type Node struct {
-	nodeID int
+	nodeID int64
 	node   *node.Node
 	proxy  proxy.AppProxy
 	logger *logrus.Logger

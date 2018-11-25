@@ -2,6 +2,9 @@
 .vscode
 .idea/
 
+# Go prof output
+*.prof
+
 # Go test output
 */*.test
 */*.out
@@ -11,16 +14,24 @@ build
 
 # Dependencies
 vendor
+glide.lock
 
 # gomobile compilation output
 *.aar
 *.jar
 
 # lachesis project specific
-docker/builder/nodes
-docker/builder/certs
-docker/builder/peers.json
-docker/builder/upx
+scripts/certs
+scripts/nodes
+scripts/peers.json
+scripts/docker/upx
 nodes
 peers.json
 certs
+lachesis_*
+
+# Backup copies
+*~
+*.bak
+
+.#*

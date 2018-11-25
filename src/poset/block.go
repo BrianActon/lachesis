@@ -1,13 +1,12 @@
 package poset
 
 import (
-	"bytes"
 	"crypto/ecdsa"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 
-	"github.com/andrecronje/lachesis/src/crypto"
+	"github.com/Fantom-foundation/go-lachesis/src/crypto"
+	"github.com/golang/protobuf/proto"
 )
 
 //StateHash is the hash of the current state of transactions, if you have one
@@ -15,35 +14,22 @@ import (
 //stateHash will be different
 //statehash should be ignored for validator checking
 
-type BlockBody struct {
-	Index         int
-	RoundReceived int
-	StateHash     []byte
-	FrameHash     []byte
-	Transactions  [][]byte
-}
-
 //json encoding of body only
-func (bb *BlockBody) Marshal() ([]byte, error) {
-	bf := bytes.NewBuffer([]byte{})
-	enc := json.NewEncoder(bf)
-	if err := enc.Encode(bb); err != nil {
+func (bb *BlockBody) ProtoMarshal() ([]byte, error) {
+	var bf proto.Buffer
+	bf.SetDeterministic(true)
+	if err := bf.Marshal(bb); err != nil {
 		return nil, err
 	}
 	return bf.Bytes(), nil
 }
 
-func (bb *BlockBody) Unmarshal(data []byte) error {
-	b := bytes.NewBuffer(data)
-	dec := json.NewDecoder(b) //will read from b
-	if err := dec.Decode(bb); err != nil {
-		return err
-	}
-	return nil
+func (bb *BlockBody) ProtoUnmarshal(data []byte) error {
+	return proto.Unmarshal(data, bb)
 }
 
 func (bb *BlockBody) Hash() ([]byte, error) {
-	hashBytes, err := bb.Marshal()
+	hashBytes, err := bb.ProtoMarshal()
 	if err != nil {
 		return nil, err
 	}
@@ -52,32 +38,21 @@ func (bb *BlockBody) Hash() ([]byte, error) {
 
 //------------------------------------------------------------------------------
 
-type BlockSignature struct {
-	Validator []byte
-	Index     int
-	Signature string
-}
-
 func (bs *BlockSignature) ValidatorHex() string {
 	return fmt.Sprintf("0x%X", bs.Validator)
 }
 
-func (bs *BlockSignature) Marshal() ([]byte, error) {
-	bf := bytes.NewBuffer([]byte{})
-	enc := json.NewEncoder(bf)
-	if err := enc.Encode(bs); err != nil {
+func (bs *BlockSignature) ProtoMarshal() ([]byte, error) {
+	var bf proto.Buffer
+	bf.SetDeterministic(true)
+	if err := bf.Marshal(bs); err != nil {
 		return nil, err
 	}
 	return bf.Bytes(), nil
 }
 
-func (bs *BlockSignature) Unmarshal(data []byte) error {
-	b := bytes.NewBuffer(data)
-	dec := json.NewDecoder(b) //will read from b
-	if err := dec.Decode(bs); err != nil {
-		return err
-	}
-	return nil
+func (bs *BlockSignature) ProtoUnmarshal(data []byte) error {
+	return proto.Unmarshal(data, bs)
 }
 
 func (bs *BlockSignature) ToWire() WireBlockSignature {
@@ -87,34 +62,21 @@ func (bs *BlockSignature) ToWire() WireBlockSignature {
 	}
 }
 
-type WireBlockSignature struct {
-	Index     int
-	Signature string
-}
-
 //------------------------------------------------------------------------------
 
-type Block struct {
-	Body       BlockBody
-	Signatures map[string]string // [validator hex] => signature
-
-	hash []byte
-	hex  string
-}
-
-func NewBlockFromFrame(blockIndex int, frame Frame) (Block, error) {
+func NewBlockFromFrame(blockIndex int64, frame Frame) (Block, error) {
 	frameHash, err := frame.Hash()
 	if err != nil {
 		return Block{}, err
 	}
-	transactions := [][]byte{}
+	var transactions [][]byte
 	for _, e := range frame.Events {
-		transactions = append(transactions, e.Transactions()...)
+		transactions = append(transactions, e.Body.Transactions...)
 	}
 	return NewBlock(blockIndex, frame.Round, frameHash, transactions), nil
 }
 
-func NewBlock(blockIndex, roundReceived int, frameHash []byte, txs [][]byte) Block {
+func NewBlock(blockIndex, roundReceived int64, frameHash []byte, txs [][]byte) Block {
 	body := BlockBody{
 		Index:         blockIndex,
 		RoundReceived: roundReceived,
@@ -122,12 +84,12 @@ func NewBlock(blockIndex, roundReceived int, frameHash []byte, txs [][]byte) Blo
 		Transactions:  txs,
 	}
 	return Block{
-		Body:       body,
+		Body:       &body,
 		Signatures: make(map[string]string),
 	}
 }
 
-func (b *Block) Index() int {
+func (b *Block) Index() int64 {
 	return b.Body.Index
 }
 
@@ -135,7 +97,7 @@ func (b *Block) Transactions() [][]byte {
 	return b.Body.Transactions
 }
 
-func (b *Block) RoundReceived() int {
+func (b *Block) RoundReceived() int64 {
 	return b.Body.RoundReceived
 }
 
@@ -147,7 +109,7 @@ func (b *Block) FrameHash() []byte {
 	return b.Body.FrameHash
 }
 
-func (b *Block) GetSignatures() []BlockSignature {
+func (b *Block) GetBlockSignatures() []BlockSignature {
 	res := make([]BlockSignature, len(b.Signatures))
 	i := 0
 	for val, sig := range b.Signatures {
@@ -180,47 +142,29 @@ func (b *Block) AppendTransactions(txs [][]byte) {
 	b.Body.Transactions = append(b.Body.Transactions, txs...)
 }
 
-func (b *Block) Marshal() ([]byte, error) {
-	bf := bytes.NewBuffer([]byte{})
-	enc := json.NewEncoder(bf)
-	if err := enc.Encode(b); err != nil {
+func (b *Block) ProtoMarshal() ([]byte, error) {
+	var bf proto.Buffer
+	bf.SetDeterministic(true)
+	if err := bf.Marshal(b); err != nil {
 		return nil, err
 	}
 	return bf.Bytes(), nil
 }
 
-func (b *Block) Unmarshal(data []byte) error {
-	bf := bytes.NewBuffer(data)
-	dec := json.NewDecoder(bf)
-	if err := dec.Decode(b); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (b *Block) Hash() ([]byte, error) {
-	if len(b.hash) == 0 {
-		hashBytes, err := b.Marshal()
-		if err != nil {
-			return nil, err
-		}
-		b.hash = crypto.SHA256(hashBytes)
-	}
-	return b.hash, nil
-}
-
-func (b *Block) Hex() string {
-	if b.hex == "" {
-		hash, _ := b.Hash()
-		b.hex = fmt.Sprintf("0x%X", hash)
-	}
-	return b.hex
+func (b *Block) ProtoUnmarshal(data []byte) error {
+	return proto.Unmarshal(data, b)
 }
 
 func (b *Block) Sign(privKey *ecdsa.PrivateKey) (bs BlockSignature, err error) {
+	// TODO: Currently StateHash value is different on sender and receiver
+	// so we need to review StateHash placement inside block body.
+	// Setting StateHash to nil before Hash calculation is a temporary fix for
+	// block signature verification bug https://github.com/Fantom-foundation/go-lachesis/issues/42
+	saveStateHash := b.Body.StateHash
 	b.Body.StateHash = nil
 
 	signBytes, err := b.Body.Hash()
+	b.Body.StateHash = saveStateHash
 	if err != nil {
 		return bs, err
 	}
@@ -243,9 +187,15 @@ func (b *Block) SetSignature(bs BlockSignature) error {
 }
 
 func (b *Block) Verify(sig BlockSignature) (bool, error) {
+	// TODO: Currently StateHash value is different on sender and receiver
+	// so we need to review StateHash placement inside block body.
+	// Setting StateHash to nil before Hash calculation is a temporary fix for
+	// block signature verification bug https://github.com/Fantom-foundation/go-lachesis/issues/42
+	saveStateHash := b.Body.StateHash
 	b.Body.StateHash = nil
 
 	signBytes, err := b.Body.Hash()
+	b.Body.StateHash = saveStateHash
 	if err != nil {
 		return false, err
 	}
@@ -258,4 +208,49 @@ func (b *Block) Verify(sig BlockSignature) (bool, error) {
 	}
 
 	return crypto.Verify(pubKey, signBytes, r, s), nil
+}
+
+func ListBytesEquals(this [][]byte, that [][]byte) bool {
+	if len(this) != len(that) {
+		return false
+	}
+	for i, v := range this {
+		if !BytesEquals(v, that[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+
+func (this *BlockBody) Equals(that *BlockBody) bool {
+	return this.Index == that.Index &&
+		this.RoundReceived == that.RoundReceived &&
+		BytesEquals(this.StateHash, that.StateHash) &&
+		BytesEquals(this.FrameHash, that.FrameHash) &&
+		ListBytesEquals(this.Transactions, that.Transactions)
+}
+
+func (this *WireBlockSignature) Equals(that *WireBlockSignature) bool {
+	return this.Index == that.Index && this.Signature == that.Signature
+}
+
+func MapStringsEquals(this map[string]string, that map[string]string) bool {
+	if len(this) != len(that) {
+		return false
+	}
+	for k, v := range this {
+		v1, ok := that[k]
+		if !ok || v != v1 {
+			return false
+		}
+	}
+	return true
+}
+
+func (this *Block) Equals(that *Block) bool {
+	return this.Body.Equals(that.Body) &&
+		MapStringsEquals(this.Signatures, that.Signatures) &&
+		BytesEquals(this.Hash, that.Hash) &&
+		this.Hex == that.Hex
 }
