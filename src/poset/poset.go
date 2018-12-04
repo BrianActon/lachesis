@@ -13,6 +13,8 @@ import (
 	"github.com/Fantom-foundation/go-lachesis/src/common"
 	"github.com/Fantom-foundation/go-lachesis/src/log"
 	"github.com/Fantom-foundation/go-lachesis/src/peers"
+
+	_ "github.com/Fantom-foundation/pgLachesis"
 )
 
 // Core is an interface for interacting with a core.
@@ -1234,6 +1236,11 @@ func (p *Poset) ProcessDecidedRounds() error {
 
 				if p.commitCh != nil {
 					p.commitCh <- block
+				}
+
+				//  Write block to Postgres DB where it will be stored for access by explorer
+				if err := pgLachesis.WriteBlock(block); err != nil {
+					return err
 				}
 			}
 
